@@ -64,11 +64,21 @@ pub async fn drift_simulate(
 /// Mine decisions from git history.
 #[napi]
 pub async fn drift_decisions(repo_path: String) -> Result<String> {
+    use drift_core::events::types::DecisionMinedEvent;
     use drift_analysis::advanced::decisions::git_analysis::GitAnalyzer;
 
     let analyzer = GitAnalyzer::new().with_max_commits(500);
     let decisions = analyzer.analyze(std::path::Path::new(&repo_path))
         .map_err(|e| Error::from_reason(format!("Git analysis error: {}", e)))?;
+
+    if let Ok(rt) = crate::runtime::get() {
+        for decision in &decisions {
+            rt.dispatcher.emit_decision_mined(&DecisionMinedEvent {
+                decision_id: decision.id.clone(),
+                category: decision.category.to_string(),
+            });
+        }
+    }
 
     serde_json::to_string(&decisions)
         .map_err(|e| Error::from_reason(format!("Serialization error: {}", e)))
