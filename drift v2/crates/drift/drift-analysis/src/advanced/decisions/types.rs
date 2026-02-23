@@ -60,6 +60,8 @@ pub struct Decision {
     pub commit_sha: Option<String>,
     pub timestamp: i64,
     pub confidence: f64,
+    #[serde(default)]
+    pub low_confidence: bool,
     pub related_patterns: Vec<String>,
     pub author: Option<String>,
     pub files_changed: Vec<String>,
