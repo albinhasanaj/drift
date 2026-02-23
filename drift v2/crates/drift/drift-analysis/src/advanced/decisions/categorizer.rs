@@ -7,11 +7,20 @@ pub struct DecisionCategorizer {
     rules: Vec<CategorizationRule>,
 }
 
+const PATH_ONLY_CONFIDENCE_FLOOR: f64 = 0.15;
+const PATH_ONLY_KEYWORD_MAX_SCORE: f64 = 0.05;
+
 struct CategorizationRule {
     category: DecisionCategory,
     keywords: Vec<&'static str>,
     file_patterns: Vec<&'static str>,
     min_confidence: f64,
+}
+
+struct RuleScore {
+    total: f64,
+    keyword_score: f64,
+    file_hits: usize,
 }
 
 impl DecisionCategorizer {
@@ -32,12 +41,21 @@ impl DecisionCategorizer {
 
         let mut best_category = None;
         let mut best_confidence = 0.0;
+        let mut best_low_confidence = false;
 
         for rule in &self.rules {
-            let confidence = self.score_rule(rule, &msg_lower, &commit.files_changed);
-            if confidence > rule.min_confidence && confidence > best_confidence {
+            let rule_score = self.score_rule(rule, &msg_lower, &commit.files_changed);
+            let is_path_only = rule_score.file_hits > 0 && rule_score.keyword_score <= PATH_ONLY_KEYWORD_MAX_SCORE;
+            let meets_threshold = if is_path_only {
+                rule_score.total >= PATH_ONLY_CONFIDENCE_FLOOR
+            } else {
+                rule_score.total > rule.min_confidence
+            };
+
+            if meets_threshold && rule_score.total > best_confidence {
                 best_category = Some(rule.category);
-                best_confidence = confidence;
+                best_confidence = rule_score.total;
+                best_low_confidence = is_path_only;
             }
         }
 
@@ -52,6 +70,7 @@ impl DecisionCategorizer {
                 commit_sha: Some(commit.sha.clone()),
                 timestamp: commit.timestamp,
                 confidence: best_confidence,
+                low_confidence: best_low_confidence,
                 related_patterns: Vec::new(),
                 author: Some(commit.author.clone()),
                 files_changed: commit.files_changed.clone(),
@@ -64,22 +83,27 @@ impl DecisionCategorizer {
         rule: &CategorizationRule,
         msg_lower: &str,
         files: &[String],
-    ) -> f64 {
-        let mut score = 0.0;
+    ) -> RuleScore {
+        let mut keyword_score = 0.0;
+        let mut file_score = 0.0;
 
         // Keyword matching in commit message
         let keyword_hits: usize = rule.keywords.iter()
             .filter(|kw| msg_lower.contains(*kw))
             .count();
-        score += (keyword_hits as f64 * 0.3).min(0.6);
+        keyword_score += (keyword_hits as f64 * 0.3).min(0.6);
 
         // File pattern matching
         let file_hits: usize = rule.file_patterns.iter()
             .filter(|pat| files.iter().any(|f| f.contains(*pat)))
             .count();
-        score += (file_hits as f64 * 0.2).min(0.4);
+        file_score += (file_hits as f64 * 0.2).min(0.4);
 
-        score.min(1.0)
+        RuleScore {
+            total: (keyword_score + file_score).min(1.0),
+            keyword_score,
+            file_hits,
+        }
     }
 
     fn is_trivial_commit(msg: &str) -> bool {
@@ -285,6 +309,18 @@ mod tests {
         let cat = DecisionCategorizer::new();
         let commit = make_commit("merge branch 'main' into feature", vec!["src/app.ts"]);
         assert!(cat.categorize_commit(&commit).is_none());
+    }
+
+    #[test]
+    fn test_path_only_fallback_sets_low_confidence() {
+        let cat = DecisionCategorizer::new();
+        let commit = make_commit("update", vec!["src/cache/index.ts"]);
+        let decision = cat.categorize_commit(&commit);
+        assert!(decision.is_some());
+        let decision = decision.unwrap();
+        assert_eq!(decision.category, DecisionCategory::Performance);
+        assert!(decision.low_confidence);
+        assert!(decision.confidence >= PATH_ONLY_CONFIDENCE_FLOOR);
     }
 
     #[test]
