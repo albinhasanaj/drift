@@ -460,7 +460,7 @@ pub fn drift_get_import_graph() -> napi::Result<JsImportGraph> {
             .and_then(|mut stmt| {
                 let rows = stmt.query_map([], |row| row.get::<_, String>(0))
                     .map_err(|e| drift_core::errors::StorageError::SqliteError { message: e.to_string() })?;
-                rows.collect::<Result<Vec<_>, rusqlite::Error>>()
+                rows.collect::<std::result::Result<Vec<_>, _>>()
                     .map_err(|e| drift_core::errors::StorageError::SqliteError { message: e.to_string() })
             })
     }).map_err(storage_err)?;
@@ -609,7 +609,7 @@ pub fn drift_get_reachability(entry_point_files: Vec<String>) -> napi::Result<Js
             .and_then(|mut stmt| {
                 let rows = stmt.query_map([], |row| row.get::<_, String>(0))
                     .map_err(|e| drift_core::errors::StorageError::SqliteError { message: e.to_string() })?;
-                rows.collect::<Result<Vec<_>, rusqlite::Error>>()
+                rows.collect::<std::result::Result<Vec<_>, _>>()
                     .map_err(|e| drift_core::errors::StorageError::SqliteError { message: e.to_string() })
             })
     }).map_err(storage_err)?;
