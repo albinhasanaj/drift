@@ -1,5 +1,6 @@
 //! CallGraphBuilder — parallel extraction via rayon, builds petgraph StableGraph.
 
+use std::path::PathBuf;
 use std::time::Instant;
 
 use drift_core::errors::CallGraphError;
@@ -10,12 +11,17 @@ use crate::parsers::types::{CallSite, ParseResult};
 
 use super::di_support;
 use super::resolution::{resolve_call, ResolutionDiagnostics};
+use super::tsconfig::{AliasRule, TsConfigPaths};
 use super::types::{CallEdge, CallGraph, CallGraphStats, FunctionNode};
 
 /// Builder for constructing a call graph from parse results.
 pub struct CallGraphBuilder {
     /// Maximum number of functions before switching to CTE fallback.
     pub in_memory_threshold: usize,
+    /// Optional project root for tsconfig.json discovery.
+    pub project_root: Option<PathBuf>,
+    /// Pre-loaded tsconfig path alias configuration.
+    pub tsconfig_paths: Option<TsConfigPaths>,
 }
 
 impl CallGraphBuilder {
@@ -23,6 +29,8 @@ impl CallGraphBuilder {
     pub fn new() -> Self {
         Self {
             in_memory_threshold: 500_000,
+            project_root: None,
+            tsconfig_paths: None,
         }
     }
 
@@ -30,7 +38,21 @@ impl CallGraphBuilder {
     pub fn with_threshold(threshold: usize) -> Self {
         Self {
             in_memory_threshold: threshold,
+            project_root: None,
+            tsconfig_paths: None,
         }
+    }
+
+    /// Set the project root for tsconfig.json discovery.
+    pub fn with_project_root(mut self, root: PathBuf) -> Self {
+        self.project_root = Some(root);
+        self
+    }
+
+    /// Set pre-loaded tsconfig path aliases.
+    pub fn with_tsconfig_paths(mut self, paths: TsConfigPaths) -> Self {
+        self.tsconfig_paths = Some(paths);
+        self
     }
 
     /// Build a call graph from a set of parse results.
@@ -143,6 +165,25 @@ impl CallGraphBuilder {
             }
         }
 
+        // Load tsconfig alias rules for import resolution
+        let alias_rules: Vec<AliasRule> = if let Some(ref tc) = self.tsconfig_paths {
+            tc.compile_rules()
+        } else if let Some(ref root) = self.project_root {
+            TsConfigPaths::load(root)
+                .map(|tc| tc.compile_rules())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        if !alias_rules.is_empty() {
+            tracing::info!(
+                "tsconfig alias rules loaded: {} rules (prefixes: {})",
+                alias_rules.len(),
+                alias_rules.iter().map(|r| r.prefix.as_str()).collect::<Vec<_>>().join(", ")
+            );
+        }
+
         // CG-RES-05: Detect DI frameworks for DI resolution
         let detected_frameworks = di_support::detect_di_frameworks(parse_results);
 
@@ -170,7 +211,6 @@ impl CallGraphBuilder {
         for (caller_key, call_site, pr) in &call_entries {
             let caller_language = pr.language.name();
             if let Some(caller_idx) = graph.get_node(caller_key) {
-                // Try standard resolution chain first
                 let resolution_result = resolve_call(
                     call_site,
                     &pr.file,
@@ -180,6 +220,7 @@ impl CallGraphBuilder {
                     &qualified_index,
                     &export_index,
                     &language_index,
+                    &alias_rules,
                 );
 
                 // CG-RES-05: If standard resolution fails, try DI resolution
@@ -221,8 +262,12 @@ impl CallGraphBuilder {
             tracing::warn!("{}", warning);
         }
 
-        // Detect entry points
-        super::traversal::mark_entry_points(&mut graph, parse_results);
+        // Detect entry points (with manifest support when project_root is available)
+        super::traversal::mark_entry_points_with_root(
+            &mut graph,
+            parse_results,
+            self.project_root.as_deref(),
+        );
 
         let total_calls = call_entries.len();
         let stats = CallGraphStats {
@@ -249,6 +294,18 @@ impl CallGraphBuilder {
 impl Default for CallGraphBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl CallGraphBuilder {
+    /// Create a builder that auto-discovers tsconfig from the project root.
+    pub fn for_project(project_root: PathBuf) -> Self {
+        let tsconfig = TsConfigPaths::load(&project_root);
+        Self {
+            in_memory_threshold: 500_000,
+            project_root: Some(project_root),
+            tsconfig_paths: tsconfig,
+        }
     }
 }
 

@@ -515,8 +515,11 @@ pub async fn drift_analyze(max_phase: Option<u32>) -> napi::Result<Vec<JsAnalysi
             }
         }
 
-        // Call graph building → persist call edges
-        let cg_builder = drift_analysis::call_graph::CallGraphBuilder::new();
+        // Call graph building → persist call edges (with tsconfig alias resolution)
+        let cg_builder = match &rt.project_root {
+            Some(root) => drift_analysis::call_graph::CallGraphBuilder::for_project(root.clone()),
+            None => drift_analysis::call_graph::CallGraphBuilder::new(),
+        };
         if let Ok((call_graph, _stats)) = cg_builder.build(&all_parse_results) {
             use petgraph::visit::{EdgeRef, IntoEdgeReferences};
             let call_edge_rows: Vec<drift_storage::batch::commands::CallEdgeRow> = call_graph
@@ -1269,8 +1272,11 @@ pub async fn drift_analyze(max_phase: Option<u32>) -> napi::Result<Vec<JsAnalysi
 
     // Step 6: Graph intelligence — taint, error handling, impact, test topology
     if !all_parse_results.is_empty() {
-        // Re-build call graph (or reuse from Step 3b if we stored it)
-        let cg_builder = drift_analysis::call_graph::CallGraphBuilder::new();
+        // Re-build call graph with tsconfig alias resolution
+        let cg_builder = match &rt.project_root {
+            Some(root) => drift_analysis::call_graph::CallGraphBuilder::for_project(root.clone()),
+            None => drift_analysis::call_graph::CallGraphBuilder::new(),
+        };
         let call_graph_result = cg_builder.build(&all_parse_results);
 
         if let Ok((ref call_graph, ref _cg_stats)) = call_graph_result {

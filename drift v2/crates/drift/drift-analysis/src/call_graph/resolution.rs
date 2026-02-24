@@ -5,6 +5,7 @@ use drift_core::types::collections::FxHashMap;
 
 use crate::parsers::types::{CallSite, ImportInfo};
 
+use super::tsconfig::AliasRule;
 use super::types::Resolution;
 
 /// Names too common for fuzzy resolution — matching these produces false positives.
@@ -105,6 +106,9 @@ impl ResolutionDiagnostics {
 ///
 /// Tries strategies in order: SameFile → MethodCall → ImportBased → ExportBased → Fuzzy.
 /// Returns the callee key and the resolution strategy used.
+///
+/// When `alias_rules` is non-empty, import sources are also resolved through
+/// tsconfig path aliases (e.g. `@/components/Button` → `src/components/Button`).
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_call(
     call_site: &CallSite,
@@ -115,6 +119,7 @@ pub fn resolve_call(
     qualified_index: &FxHashMap<String, String>,
     export_index: &FxHashMap<String, Vec<String>>,
     language_index: &FxHashMap<String, String>,
+    alias_rules: &[AliasRule],
 ) -> Option<(String, Resolution)> {
     // Strategy 1: Same-file direct call (confidence 0.95)
     if let Some(result) = resolve_same_file(call_site, caller_file, name_index) {
@@ -122,17 +127,17 @@ pub fn resolve_call(
     }
 
     // Strategy 2: Method call on known receiver (confidence 0.90)
-    if let Some(result) = resolve_method_call(call_site, caller_file, imports, qualified_index, name_index) {
+    if let Some(result) = resolve_method_call(call_site, caller_file, imports, qualified_index, name_index, alias_rules) {
         return Some((result, Resolution::MethodCall));
     }
 
     // Strategy 3: Import-based resolution (confidence 0.75)
-    if let Some(result) = resolve_import_based(call_site, imports, name_index) {
+    if let Some(result) = resolve_import_based(call_site, imports, name_index, alias_rules) {
         return Some((result, Resolution::ImportBased));
     }
 
     // Strategy 4: Export-based cross-module (confidence 0.60)
-    if let Some(result) = resolve_export_based(call_site, caller_file, caller_language, imports, export_index, language_index) {
+    if let Some(result) = resolve_export_based(call_site, caller_file, caller_language, imports, export_index, language_index, alias_rules) {
         return Some((result, Resolution::ExportBased));
     }
 
@@ -168,6 +173,7 @@ fn resolve_method_call(
     imports: &[ImportInfo],
     qualified_index: &FxHashMap<String, String>,
     name_index: &FxHashMap<String, Vec<String>>,
+    alias_rules: &[AliasRule],
 ) -> Option<String> {
     let receiver = match call_site.receiver {
         Some(ref r) => r,
@@ -190,11 +196,17 @@ fn resolve_method_call(
             });
 
         if is_namespace || import.specifiers.iter().any(|s| s.alias.as_deref() == Some(receiver)) {
-            // Look for callee_name in the source module's functions
             if let Some(keys) = name_index.get(&call_site.callee_name) {
+                // Try original source first, then alias-resolved source
+                let resolved = super::tsconfig::resolve_alias(&import.source, alias_rules);
                 for key in keys {
                     if key.contains(&import.source) {
                         return Some(key.clone());
+                    }
+                    if let Some(ref resolved_src) = resolved {
+                        if key.to_lowercase().contains(&resolved_src.to_lowercase()) {
+                            return Some(key.clone());
+                        }
                     }
                 }
             }
@@ -223,6 +235,7 @@ fn resolve_import_based(
     call_site: &CallSite,
     imports: &[ImportInfo],
     name_index: &FxHashMap<String, Vec<String>>,
+    alias_rules: &[AliasRule],
 ) -> Option<String> {
     let callee_name = &call_site.callee_name;
 
@@ -236,8 +249,7 @@ fn resolve_import_based(
             });
             if is_namespace_match {
                 if let Some(keys) = name_index.get(callee_name) {
-                    // Prefer keys from the import source module
-                    if let Some(key) = best_key_for_source(keys, &import.source) {
+                    if let Some(key) = best_key_for_source(keys, &import.source, alias_rules) {
                         return Some(key);
                     }
                     if let Some(key) = keys.first() {
@@ -251,24 +263,19 @@ fn resolve_import_based(
         for spec in &import.specifiers {
             let effective_name = spec.alias.as_deref().unwrap_or(&spec.name);
             if effective_name == callee_name {
-                // Look up the original name (not alias) in the name index
                 if let Some(keys) = name_index.get(&spec.name) {
-                    // CG-RES-01: Prefer keys from files matching the import source path
-                    if let Some(key) = best_key_for_source(keys, &import.source) {
+                    if let Some(key) = best_key_for_source(keys, &import.source, alias_rules) {
                         return Some(key);
                     }
-                    // Fall back to first match
                     return keys.first().cloned();
                 }
             }
         }
 
         // CG-RES-02: Default import — import React from 'react'
-        // specifiers may be empty or have a single entry with name == "default"
         if import.specifiers.is_empty() {
-            // The import source is the module, callee_name might be the default export name
             if let Some(keys) = name_index.get(callee_name) {
-                if let Some(key) = best_key_for_source(keys, &import.source) {
+                if let Some(key) = best_key_for_source(keys, &import.source, alias_rules) {
                     return Some(key);
                 }
             }
@@ -279,16 +286,14 @@ fn resolve_import_based(
             if is_default {
                 let alias = spec.alias.as_deref().unwrap_or(&spec.name);
                 if alias == callee_name {
-                    // Look for functions in the source module
                     if let Some(keys) = name_index.get(&spec.name) {
-                        if let Some(key) = best_key_for_source(keys, &import.source) {
+                        if let Some(key) = best_key_for_source(keys, &import.source, alias_rules) {
                             return Some(key);
                         }
                         return keys.first().cloned();
                     }
-                    // Try the callee name directly in the source
                     if let Some(keys) = name_index.get(callee_name) {
-                        if let Some(key) = best_key_for_source(keys, &import.source) {
+                        if let Some(key) = best_key_for_source(keys, &import.source, alias_rules) {
                             return Some(key);
                         }
                     }
@@ -300,11 +305,24 @@ fn resolve_import_based(
 }
 
 /// Find the best key matching a given import source module path.
-fn best_key_for_source(keys: &[String], source: &str) -> Option<String> {
-    // Normalize source: strip leading ./ ../ and extension
+/// Tries the original source first, then the alias-resolved source.
+fn best_key_for_source(keys: &[String], source: &str, alias_rules: &[AliasRule]) -> Option<String> {
+    if let Some(found) = best_key_for_normalized(keys, source) {
+        return Some(found);
+    }
+    // Try alias-resolved source
+    if let Some(resolved) = super::tsconfig::resolve_alias(source, alias_rules) {
+        if let Some(found) = best_key_for_normalized(keys, &resolved) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Match a normalized source path against available keys.
+fn best_key_for_normalized(keys: &[String], source: &str) -> Option<String> {
     let normalized = normalize_module_path(source);
 
-    // Exact path segment match (most precise)
     for key in keys {
         let key_lower = key.to_lowercase();
         let norm_lower = normalized.to_lowercase();
@@ -313,12 +331,10 @@ fn best_key_for_source(keys: &[String], source: &str) -> Option<String> {
         }
     }
 
-    // Try matching just the last segment (filename without extension)
     if let Some(last) = normalized.rsplit('/').next() {
         let last_lower = last.to_lowercase();
         for key in keys {
             let key_lower = key.to_lowercase();
-            // Match the filename portion of the key (before ::)
             if let Some(file_part) = key_lower.split("::").next() {
                 if file_part.contains(&last_lower) {
                     return Some(key.clone());
@@ -359,25 +375,36 @@ fn resolve_export_based(
     imports: &[ImportInfo],
     export_index: &FxHashMap<String, Vec<String>>,
     language_index: &FxHashMap<String, String>,
+    alias_rules: &[AliasRule],
 ) -> Option<String> {
     let keys = export_index.get(&call_site.callee_name)?;
 
-    // Single match — use it directly
     if keys.len() == 1 {
         return Some(keys[0].clone());
     }
 
     // CG-RES-04: Multi-match disambiguation
-    // 1. Check if the caller file imports from any of the exporters' files
     for key in keys {
         let exporter_file = key.split("::").next().unwrap_or("");
         for import in imports {
             let normalized = normalize_module_path(&import.source);
-            if exporter_file.to_lowercase().contains(&normalized.to_lowercase())
-                || normalized.to_lowercase().contains(
-                    &exporter_file.to_lowercase().replace(".ts", "").replace(".js", "")
+            let exporter_lower = exporter_file.to_lowercase();
+            let norm_lower = normalized.to_lowercase();
+            if exporter_lower.contains(&norm_lower)
+                || norm_lower.contains(
+                    &exporter_lower.replace(".ts", "").replace(".js", "")
                 ) {
                 return Some(key.clone());
+            }
+            // Also try alias-resolved source
+            if let Some(resolved) = super::tsconfig::resolve_alias(&import.source, alias_rules) {
+                let resolved_norm = normalize_module_path(&resolved).to_lowercase();
+                if exporter_lower.contains(&resolved_norm)
+                    || resolved_norm.contains(
+                        &exporter_lower.replace(".ts", "").replace(".js", "")
+                    ) {
+                    return Some(key.clone());
+                }
             }
         }
     }
