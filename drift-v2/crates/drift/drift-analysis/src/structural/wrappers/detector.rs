@@ -121,7 +121,9 @@ impl WrapperDetector {
         let functions = find_function_definitions(content);
 
         for func in &functions {
-            let body = &content[func.body_start..func.body_end.min(content.len())];
+            let body = content
+                .get(func.body_start..func.body_end.min(content.len()))
+                .unwrap_or("");
             let mut wrapped_primitives = Vec::new();
             let mut framework = String::new();
             let mut category = WrapperCategory::Other;
@@ -174,6 +176,7 @@ struct FunctionDef {
 fn find_function_definitions(content: &str) -> Vec<FunctionDef> {
     let mut functions = Vec::new();
     let lines: Vec<&str> = content.lines().collect();
+    let line_starts = compute_line_starts(content);
 
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
@@ -216,10 +219,9 @@ fn find_function_definitions(content: &str) -> Vec<FunctionDef> {
             }
 
             // Estimate body range (from this line to next function or end)
-            let byte_offset: usize = lines[..i].iter().map(|l| l.len() + 1).sum();
-            let body_start = byte_offset;
+            let body_start = line_starts.get(i).copied().unwrap_or(content.len());
             let body_end = if i + 50 < lines.len() {
-                lines[..i + 50].iter().map(|l| l.len() + 1).sum()
+                line_starts.get(i + 50).copied().unwrap_or(content.len())
             } else {
                 content.len()
             };
@@ -235,4 +237,37 @@ fn find_function_definitions(content: &str) -> Vec<FunctionDef> {
     }
 
     functions
+}
+
+fn compute_line_starts(content: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    for (idx, ch) in content.char_indices() {
+        if ch == '\n' {
+            starts.push(idx + 1);
+        }
+    }
+    starts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WrapperDetector;
+
+    #[test]
+    fn detect_handles_crlf_and_unicode_without_panicking() {
+        let content = [
+            "export function apiClient() {",
+            "  const note = \"contains unicode: ä ✅ ─\";",
+            "  return fetch('/api/test');",
+            "}",
+            "",
+        ].join("\r\n");
+
+        let detector = WrapperDetector::new();
+        let wrappers = detector.detect(&content, "src/sample.ts");
+
+        assert_eq!(wrappers.len(), 1);
+        assert_eq!(wrappers[0].name, "apiClient");
+        assert!(wrappers[0].wrapped_primitives.iter().any(|p| p == "fetch"));
+    }
 }
